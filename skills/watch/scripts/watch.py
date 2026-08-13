@@ -66,6 +66,22 @@ def main() -> int:
         help="Disable near-duplicate frame removal. Keeps visually identical "
              "frames (static screen recordings, held slides) instead of collapsing them.",
     )
+    ap.add_argument(
+        "--cookies",
+        type=str,
+        default=None,
+        help="Path to a Netscape-format cookies.txt file for login-walled sites "
+             "(e.g. Douyin, Bilibili). Export via a browser extension like "
+             "'Get cookies.txt LOCALLY'.",
+    )
+    ap.add_argument(
+        "--cookie-string",
+        type=str,
+        default=None,
+        help='Raw Cookie header string (e.g. from F12 Network tab → Request Headers → Cookie). '
+        'Automatically converted to a temp cookies.txt for yt-dlp. '
+        'Use this when --cookies-from-browser fails due to Chrome App-Bound encryption.',
+    )
     args = ap.parse_args()
 
     config = get_config()
@@ -96,7 +112,12 @@ def main() -> int:
 
     if url_source:
         print("[watch] checking metadata/captions via yt-dlp…", file=sys.stderr)
-        dl = fetch_captions(args.source, work / "download")
+        dl = fetch_captions(
+            args.source,
+            work / "download",
+            cookies_file=args.cookies,
+            cookie_string=args.cookie_string,
+        )
         if dl.get("subtitle_path"):
             try:
                 transcript_segments = parse_vtt(dl["subtitle_path"])
@@ -122,6 +143,8 @@ def main() -> int:
                 args.source,
                 work / "download",
                 audio_only=audio_only,
+                cookies_file=args.cookies,
+                cookie_string=args.cookie_string,
             )
         else:
             print("[watch] using local file…", file=sys.stderr)
