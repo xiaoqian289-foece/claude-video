@@ -1,6 +1,6 @@
 ---
 name: watch
-version: "0.2.0"
+version: "0.3.0"
 description: Watch a video (URL or local path). Downloads with yt-dlp, extracts auto-scaled frames with ffmpeg, pulls the transcript from captions (or Whisper API fallback), and hands the result to Claude so it can answer questions about what's in the video.
 argument-hint: "<video-url-or-path> [question]"
 allowed-tools: Bash, Read, AskUserQuestion
@@ -150,6 +150,8 @@ Optional flags:
 - `--whisper groq|openai` — force a specific Whisper backend (default: prefer Groq if both keys exist)
 - `--no-whisper` — disable the Whisper fallback entirely (frames-only if no captions)
 - `--no-dedup` — keep near-duplicate frames. By default a frame-delta pass drops frames that are visually near-identical to the previous kept one (held slides, static screen recordings, paused video) so the frame budget goes to distinct content; the report's **Frames** line notes how many were dropped. Pass this only if the user needs every sampled frame (e.g. judging subtle frame-to-frame motion).
+- `--cookies FILE` — path to a Netscape-format cookies.txt file for login-walled sites (Douyin, Bilibili, etc.). See [Login-walled videos](#login-walled-videos-douyin-bilibili-etc) below.
+- `--cookie-string "k=v; k2=v2"` — raw Cookie header string (e.g. copied from F12 → Network → Request Headers → Cookie). Automatically converted to a temp cookies.txt. Use this when `--cookies-from-browser` fails due to Chrome App-Bound encryption (Chrome 127+ on Windows).
 
 ### Focusing on a section (higher frame rate)
 
@@ -218,6 +220,54 @@ Behavior:
 - **Honors focus mode.** With `--start/--end`, any cue timestamp outside the window is dropped (reported in the summary). Coordinates are always absolute source time.
 - **Cue-only frames.** `--detail transcript --timestamps …` skips scene/keyframe sampling and returns *only* the cue frames (it will download the video to do so, since frames need pixels).
 
+## Login-walled videos (Douyin, Bilibili, etc.)
+
+Some platforms require a logged-in session for yt-dlp to access video metadata or download streams. When this happens, yt-dlp returns empty results or a verification challenge, and the watch script reports "no transcript available" or a download failure.
+
+**Symptom:** yt-dlp produces no video file, no captions, and no meaningful metadata — even though the URL works fine in a browser where you're logged in.
+
+**Root cause:** The site serves a bot-detection challenge to anonymous (cookie-less) requests. yt-dlp's built-in `--cookies-from-browser` option should work, but on **Windows with Chrome 127+** it fails because Chrome introduced [App-Bound encryption](https://developer.chrome.com/blog/app-bound-encryption) — cookies are encrypted with a key that only the Chrome process itself can access. External tools (yt-dlp, any Python library) read ciphertext and get DPAPI decryption errors (`Failed to decrypt with DPAPI`). Closing Chrome doesn't help; the encryption mechanism blocks all external access regardless of whether Chrome is running.
+
+**Solution — pass cookies manually via one of two methods:**
+
+### Method 1: `--cookie-string` (quickest, no extra tools)
+
+1. Open the video page in your browser (where you're logged in).
+2. Press **F12** → **Network** tab.
+3. Refresh the page, click any request to the video's domain.
+4. In **Request Headers**, find the `Cookie:` line — copy the **entire value** (everything after `Cookie:`).
+5. Pass it to the watch script:
+
+```bash
+python3 "${SKILL_DIR}/scripts/watch.py" "https://www.douyin.com/video/xxxxx" \
+  --cookie-string "ttwid=1|abc; msToken=xyz; sid_guard=def; ..."
+```
+
+The script auto-converts the raw string to a temporary Netscape-format cookies.txt, feeds it to yt-dlp, and deletes the temp file when done.
+
+### Method 2: `--cookies FILE` (for repeated use)
+
+1. Install a browser extension that exports cookies in Netscape format:
+   - Chrome: [Get cookies.txt LOCALLY](https://chromewebstore.google.com/detail/get-cookies-txt-locally/cclelndahbckbenkjhflpdbgdldlbecc)
+   - Firefox: [cookies.txt](https://addons.mozilla.org/en-US/firefox/addon/cookies-txt/)
+2. Navigate to the video site while logged in, click the extension, and **Export** → save as `cookies.txt`.
+3. Pass the file path:
+
+```bash
+python3 "${SKILL_DIR}/scripts/watch.py" "https://www.douyin.com/video/xxxxx" \
+  --cookies /path/to/cookies.txt
+```
+
+### When to use which
+
+| Situation | Recommended method |
+|-----------|-------------------|
+| Quick one-off, no extensions to install | `--cookie-string` |
+| Repeated use across multiple videos from the same site | `--cookies FILE` |
+| `--cookies-from-browser` fails with DPAPI/encryption error | Either (both bypass the browser entirely) |
+
+**Security note:** Cookie strings grant the same access as your logged-in session. The script writes them only to a temporary file (deleted after use) and never logs them. For maximum safety, use a fresh incognito session to capture cookies rather than your main session.
+
 ## Transcription
 
 The script gets a timestamped transcript in one of two ways:
@@ -234,7 +284,7 @@ Both keys live in `~/.config/watch/.env`. The script prefers Groq when both are 
 - **Setup preflight failed** → run `python3 "${SKILL_DIR}/scripts/setup.py"` (auto-installs ffmpeg/yt-dlp via brew on macOS, scaffolds the `.env`). For API key, ask the user via `AskUserQuestion` and write it to `~/.config/watch/.env`.
 - **No transcript available** → captions missing AND (no Whisper key OR Whisper API failed). Script prints a hint pointing to setup. Proceed frames-only and tell the user.
 - **Long video warning printed** → acknowledge it in your answer. Offer to re-run focused on a specific section via `--start`/`--end` rather than a sparse full-video scan.
-- **Download fails** → yt-dlp's error goes to stderr. If it's a login-required or region-locked video, tell the user plainly; do not keep retrying.
+- **Download fails** → yt-dlp's error goes to stderr. If it's a login-required or region-locked video, tell the user plainly; do not keep retrying. For login-walled sites (Douyin, Bilibili, etc.) where the browser works but yt-dlp gets a blank/blocked response, ask the user to provide cookies via `--cookie-string` or `--cookies` (see [Login-walled videos](#login-walled-videos-douyin-bilibili-etc) above). On Windows with Chrome 127+, `--cookies-from-browser` will fail with DPAPI errors — the manual cookie methods above are the reliable workaround.
 - **Whisper request fails** → the error is printed to stderr (likely: invalid key or rate limit). Audio over the API's 25 MB upload cap is split into chunks and transcribed automatically, so length alone won't fail it; if some chunks fail the transcript is partial and the dropped chunks are noted on stderr. The report will say "none available" only if every chunk fails. You can retry with `--whisper openai` if Groq failed (or vice versa).
 
 ## Token efficiency
@@ -250,6 +300,7 @@ If you already watched a video this session and the user asks a follow-up, do **
 
 **What this skill does:**
 - Runs `yt-dlp` locally to download the video and pull native captions when the source supports them (public data; the request goes directly to whatever host the URL points at)
+- When the user explicitly provides cookies via `--cookies` or `--cookie-string`, passes them to yt-dlp to access login-walled content (e.g. Douyin, Bilibili). Cookie strings are written to a temporary file that is deleted immediately after the yt-dlp subprocess completes.
 - Runs `ffmpeg` / `ffprobe` locally to extract frames as JPEGs and, when Whisper is needed, a mono 16 kHz audio clip
 - Sends the extracted audio clip to Groq's Whisper API (`api.groq.com/openai/v1/audio/transcriptions`) when `GROQ_API_KEY` is set (preferred — cheaper, faster)
 - Sends the extracted audio clip to OpenAI's audio transcription API (`api.openai.com/v1/audio/transcriptions`) when `OPENAI_API_KEY` is set and Groq is not, or when `--whisper openai` is forced
@@ -258,7 +309,8 @@ If you already watched a video this session and the user asks a follow-up, do **
 
 **What this skill does NOT do:**
 - Does not upload the video itself to any API — only the extracted audio goes out, and only when native captions are missing AND Whisper is not disabled with `--no-whisper`
-- Does not access any platform account (no login, no session cookies, no posting) — yt-dlp only ever requests public data
+- Does not access any platform account unless the user explicitly provides cookies via `--cookies` or `--cookie-string`. Without explicit cookie input, yt-dlp only requests public data.
+- Does not log, cache, or write cookies to stdout, stderr, or persistent output files — temp cookie files are deleted after use
 - Does not share API keys between providers (Groq key only goes to `api.groq.com`, OpenAI key only goes to `api.openai.com`)
 - Does not log, cache, or write API keys to stdout, stderr, or output files
 - Does not persist anything outside the working directory and `~/.config/watch/.env` — clean up the working directory when you're done (Step 5)
