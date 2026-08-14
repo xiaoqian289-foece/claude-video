@@ -82,6 +82,15 @@ def main() -> int:
         'Automatically converted to a temp cookies.txt for yt-dlp. '
         'Use this when --cookies-from-browser fails due to Chrome App-Bound encryption.',
     )
+    ap.add_argument(
+        "--cdp-port",
+        type=int,
+        default=9222,
+        help="Chrome DevTools Protocol port for automatic cookie extraction "
+        "(default 9222, set to 0 to disable). Requires Chrome launched with "
+        "--remote-debugging-port=PORT. Bypasses App-Bound encryption on "
+        "Windows + Chrome 127+.",
+    )
     args = ap.parse_args()
 
     config = get_config()
@@ -117,6 +126,7 @@ def main() -> int:
             work / "download",
             cookies_file=args.cookies,
             cookie_string=args.cookie_string,
+            cdp_port=args.cdp_port if args.cdp_port > 0 else None,
         )
         if dl.get("subtitle_path"):
             try:
@@ -145,6 +155,7 @@ def main() -> int:
                 audio_only=audio_only,
                 cookies_file=args.cookies,
                 cookie_string=args.cookie_string,
+                cdp_port=args.cdp_port if args.cdp_port > 0 else None,
             )
         else:
             print("[watch] using local file…", file=sys.stderr)
