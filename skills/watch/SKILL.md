@@ -1,6 +1,6 @@
 ---
 name: watch
-version: "0.4.0"
+version: "0.5.0"
 description: Watch a video (URL or local path). Downloads with yt-dlp, extracts auto-scaled frames with ffmpeg, pulls the transcript from captions (or Whisper API fallback), and hands the result to Claude so it can answer questions about what's in the video.
 argument-hint: "<video-url-or-path> [question]"
 allowed-tools: Bash, Read, AskUserQuestion
@@ -153,6 +153,7 @@ Optional flags:
 - `--cookies FILE` — path to a Netscape-format cookies.txt file for login-walled sites (Douyin, Bilibili, etc.). See [Login-walled videos](#login-walled-videos-douyin-bilibili-etc) below.
 - `--cookie-string "k=v; k2=v2"` — raw Cookie header string (e.g. copied from F12 → Network → Request Headers → Cookie). Automatically converted to a temp cookies.txt. Use this when `--cookies-from-browser` fails due to Chrome App-Bound encryption (Chrome 127+ on Windows).
 - `--cdp-port PORT` — Chrome DevTools Protocol port for **automatic** cookie extraction (default 9222, set to 0 to disable). When Chrome is running with `--remote-debugging-port=PORT`, the script pulls cookies directly from the browser process via CDP — bypassing App-Bound encryption entirely. No manual cookie copying needed. See [Login-walled videos](#login-walled-videos-douyin-bilibili-etc) below.
+- `--save-cookie "k=v; k2=v2"` — save a raw Cookie header string to `~/.workbuddy/cookies/<domain>_cookies.txt` for **automatic reuse**. After saving once, future runs auto-load cookies for that domain without any flags. Get the string via F12 Console: `copy(document.cookie)`. See [Cookie persistence](#cookie-persistence-save-once-auto-reuse) below.
 
 ### Focusing on a section (higher frame rate)
 
@@ -229,7 +230,45 @@ Some platforms require a logged-in session for yt-dlp to access video metadata o
 
 **Root cause:** The site serves a bot-detection challenge to anonymous (cookie-less) requests. yt-dlp's built-in `--cookies-from-browser` option should work, but on **Windows with Chrome 127+** it fails because Chrome introduced [App-Bound encryption](https://developer.chrome.com/blog/app-bound-encryption) — cookies are encrypted with a key that only the Chrome process itself can access. External tools (yt-dlp, any Python library) read ciphertext and get DPAPI decryption errors (`Failed to decrypt with DPAPI`). Closing Chrome doesn't help; the encryption mechanism blocks all external access regardless of whether Chrome is running.
 
-**Solution — three methods, try Method 0 first (fully automatic):**
+**Solution — four methods, try the persistence method first (save once, then just send links):**
+
+### Cookie persistence (save once, auto-reuse)
+
+This is the **recommended workflow** for login-walled sites. Save cookies once with `--save-cookie`, and all future runs automatically load them — no need to pass cookies every time.
+
+**Step 1 — get the cookie string (one-time, repeat when cookies expire):**
+
+Open the video site in your browser (logged in), press **F12** → **Console** tab, type:
+
+```js
+copy(document.cookie)
+```
+
+This copies the cookie string to your clipboard.
+
+**Step 2 — save it:**
+
+```bash
+python3 "${SKILL_DIR}/scripts/watch.py" "https://www.douyin.com/video/xxxxx" \
+  --save-cookie "ttwid=1|abc; msToken=xyz; sid_guard=def; ..."
+```
+
+You'll see `[watch] cookies saved to: ~/.workbuddy/cookies/douyin_cookies.txt`.
+
+**Step 3 — from now on, just send the link:**
+
+```bash
+# No cookie flags needed — auto-loaded from ~/.workbuddy/cookies/
+python3 "${SKILL_DIR}/scripts/watch.py" "https://www.douyin.com/video/yyyyy"
+```
+
+You'll see `[watch] using persisted cookies: ~/.workbuddy/cookies/douyin_cookies.txt` on stderr.
+
+**When cookies expire (every few hours to ~1 day):** yt-dlp will fail with a login/verification error. Just repeat Step 1–2 to refresh. The old cookie file is overwritten.
+
+**Supported domains:** Douyin, Bilibili, Weibo, Xiaohongshu, Zhihu, Twitter/X, Instagram, Facebook. For other domains, the script derives a filename from the hostname automatically.
+
+**To clear saved cookies:** delete the file at `~/.workbuddy/cookies/<domain>_cookies.txt`.
 
 ### Method 0: `--cdp-port` (automatic, no manual cookie copying)
 
@@ -292,12 +331,13 @@ python3 "${SKILL_DIR}/scripts/watch.py" "https://www.douyin.com/video/xxxxx" \
 
 | Situation | Recommended method |
 |-----------|-------------------|
-| Windows + Chrome 127+ (DPAPI error), Chrome can be restarted | `--cdp-port` (automatic, no manual steps) |
-| Quick one-off, Chrome debug port not available | `--cookie-string` |
-| Repeated use across multiple videos from the same site | `--cdp-port` (if Chrome can run debug mode) or `--cookies FILE` |
-| `--cookies-from-browser` fails with DPAPI/encryption error | `--cdp-port` (preferred) or `--cookie-string` (fallback) |
+| **Any login-walled site (recommended default)** | `--save-cookie` — save once, then just send links |
+| Windows + Chrome 127+ (DPAPI error), Chrome can be restarted with debug port | `--cdp-port` (automatic, no manual steps) |
+| Quick one-off, no saved cookies, Chrome debug port not available | `--cookie-string` |
+| Repeated use across multiple videos from the same site | `--save-cookie` (save once, auto-reuse) |
+| `--cookies-from-browser` fails with DPAPI/encryption error | `--save-cookie` (preferred) or `--cdp-port` or `--cookie-string` |
 
-**Security note:** Cookie strings and CDP-extracted cookies grant the same access as your logged-in session. The script writes them only to a temporary file (deleted after use) and never logs them. CDP extraction connects only to `localhost` and never transmits cookies over the network. For maximum safety with `--cookie-string`, use a fresh incognito session to capture cookies rather than your main session.
+**Security note:** Cookie strings and CDP-extracted cookies grant the same access as your logged-in session. Persisted cookies are stored as plain-text Netscape files in `~/.workbuddy/cookies/` — ensure this directory is not shared or synced publicly. Temp files (from `--cookie-string` and CDP) are deleted after the yt-dlp subprocess completes. CDP extraction connects only to `localhost` and never transmits cookies over the network. For maximum safety, use a fresh incognito session to capture cookies rather than your main session.
 
 ## Transcription
 
@@ -315,7 +355,7 @@ Both keys live in `~/.config/watch/.env`. The script prefers Groq when both are 
 - **Setup preflight failed** → run `python3 "${SKILL_DIR}/scripts/setup.py"` (auto-installs ffmpeg/yt-dlp via brew on macOS, scaffolds the `.env`). For API key, ask the user via `AskUserQuestion` and write it to `~/.config/watch/.env`.
 - **No transcript available** → captions missing AND (no Whisper key OR Whisper API failed). Script prints a hint pointing to setup. Proceed frames-only and tell the user.
 - **Long video warning printed** → acknowledge it in your answer. Offer to re-run focused on a specific section via `--start`/`--end` rather than a sparse full-video scan.
-- **Download fails** → yt-dlp's error goes to stderr. If it's a login-required or region-locked video, tell the user plainly; do not keep retrying. For login-walled sites (Douyin, Bilibili, etc.) where the browser works but yt-dlp gets a blank/blocked response, ask the user to provide cookies via `--cookie-string` or `--cookies` (see [Login-walled videos](#login-walled-videos-douyin-bilibili-etc) above). On Windows with Chrome 127+, `--cookies-from-browser` will fail with DPAPI errors — the manual cookie methods above are the reliable workaround.
+- **Download fails** → yt-dlp's error goes to stderr. If it's a login-required or region-locked video, tell the user plainly; do not keep retrying. For login-walled sites (Douyin, Bilibili, etc.) where the browser works but yt-dlp gets a blank/blocked response: if persisted cookies exist at `~/.workbuddy/cookies/<domain>_cookies.txt`, they may have expired — ask the user to refresh via `--save-cookie`. If no persisted cookies exist, guide the user through the [Cookie persistence](#cookie-persistence-save-once-auto-reuse) workflow. On Windows with Chrome 127+, `--cookies-from-browser` will fail with DPAPI errors — the cookie methods above are the reliable workaround.
 - **Whisper request fails** → the error is printed to stderr (likely: invalid key or rate limit). Audio over the API's 25 MB upload cap is split into chunks and transcribed automatically, so length alone won't fail it; if some chunks fail the transcript is partial and the dropped chunks are noted on stderr. The report will say "none available" only if every chunk fails. You can retry with `--whisper openai` if Groq failed (or vice versa).
 
 ## Token efficiency
@@ -331,7 +371,8 @@ If you already watched a video this session and the user asks a follow-up, do **
 
 **What this skill does:**
 - Runs `yt-dlp` locally to download the video and pull native captions when the source supports them (public data; the request goes directly to whatever host the URL points at)
-- When the user explicitly provides cookies via `--cookies` or `--cookie-string`, passes them to yt-dlp to access login-walled content (e.g. Douyin, Bilibili). Cookie strings are written to a temporary file that is deleted immediately after the yt-dlp subprocess completes.
+- When the user explicitly provides cookies via `--cookies`, `--cookie-string`, or `--save-cookie`, passes them to yt-dlp to access login-walled content (e.g. Douyin, Bilibili). Cookie strings from `--cookie-string` are written to a temporary file that is deleted immediately after the yt-dlp subprocess completes. Cookies saved via `--save-cookie` are persisted to `~/.workbuddy/cookies/<domain>_cookies.txt` as plain-text Netscape files for automatic reuse across runs.
+- When no explicit cookies are provided, automatically attempts to load persisted cookies from `~/.workbuddy/cookies/` (if a file for the domain exists), then falls back to CDP extraction (if Chrome is running with `--remote-debugging-port`). Neither step requires user action.
 - When Chrome is running with `--remote-debugging-port` (default 9222), automatically extracts cookies from the browser process via the DevTools Protocol (CDP) to bypass App-Bound encryption on Windows + Chrome 127+. CDP communication is local-only (localhost WebSocket). Extracted cookies are written to a temporary file that is deleted after use.
 - Runs `ffmpeg` / `ffprobe` locally to extract frames as JPEGs and, when Whisper is needed, a mono 16 kHz audio clip
 - Sends the extracted audio clip to Groq's Whisper API (`api.groq.com/openai/v1/audio/transcriptions`) when `GROQ_API_KEY` is set (preferred — cheaper, faster)
