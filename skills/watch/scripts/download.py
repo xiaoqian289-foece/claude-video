@@ -23,6 +23,90 @@ from urllib.parse import urlparse
 
 VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".mov", ".m4v", ".avi", ".flv", ".wmv"}
 
+# Directory for persisted cookies (auto-loaded for login-walled sites)
+_COOKIE_DIR = Path.home() / ".workbuddy" / "cookies"
+
+# Known login-walled domains → cookie file name mapping
+_LOGIN_WALLED_DOMAINS = {
+    "douyin.com": "douyin",
+    "iesdouyin.com": "douyin",
+    "bilibili.com": "bilibili",
+    "b23.tv": "bilibili",
+    "weibo.com": "weibo",
+    "xiaohongshu.com": "xiaohongshu",
+    "xhslink.com": "xiaohongshu",
+    "zhihu.com": "zhihu",
+    "twitter.com": "twitter",
+    "x.com": "twitter",
+    "instagram.com": "instagram",
+    "facebook.com": "facebook",
+}
+
+
+def _match_login_walled_domain(url: str) -> str | None:
+    """Return the cookie file stem for a login-walled domain, or None."""
+    hostname = urlparse(url).hostname or ""
+    hostname = hostname.lower()
+    for domain, stem in _LOGIN_WALLED_DOMAINS.items():
+        if hostname == domain or hostname.endswith("." + domain):
+            return stem
+    return None
+
+
+def _persisted_cookie_path(url: str) -> Path | None:
+    """Return the path to a persisted cookie file for this URL's domain, if any."""
+    stem = _match_login_walled_domain(url)
+    if not stem:
+        return None
+    return _COOKIE_DIR / f"{stem}_cookies.txt"
+
+
+def save_cookie_string(cookie_string: str, url: str) -> Path:
+    """Save a raw Cookie header string to the persisted cookie directory.
+
+    Converts the cookie string to Netscape format and writes it to
+    ``~/.workbuddy/cookies/<domain>_cookies.txt``. Future calls to
+    ``_resolve_cookies`` will automatically pick up this file.
+
+    Returns the path to the saved file.
+    """
+    stem = _match_login_walled_domain(url)
+    if not stem:
+        # For unknown domains, derive a stem from the hostname
+        hostname = urlparse(url).hostname or "unknown"
+        stem = hostname.split(".")[-2] if len(hostname.split(".")) >= 2 else hostname
+
+    _COOKIE_DIR.mkdir(parents=True, exist_ok=True)
+    cookie_path = _COOKIE_DIR / f"{stem}_cookies.txt"
+
+    # Convert cookie string to Netscape format and write directly
+    parsed = urlparse(url)
+    domain = parsed.hostname or ""
+    if domain and not domain.startswith("."):
+        domain = "." + domain
+
+    expiry = int(time.time()) + 7 * 86400
+    lines = [
+        "# Netscape HTTP Cookie File",
+        f"# Persisted by watch skill — {stem}",
+        f"# Saved: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"# Domain: {domain}",
+        "# To update: re-run with --save-cookie, or delete this file to clear.",
+    ]
+    for pair in cookie_string.split(";"):
+        pair = pair.strip()
+        if not pair or "=" not in pair:
+            continue
+        name, _, value = pair.partition("=")
+        name = name.strip()
+        value = value.strip()
+        if not name:
+            continue
+        lines.append(f"{domain}\tTRUE\t/\tTRUE\t{expiry}\t{name}\t{value}")
+
+    cookie_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return cookie_path
+
 
 def _cookie_string_to_file(cookie_string: str, url: str) -> str:
     """Convert a raw Cookie header string (e.g. from F12 → Network) to a
@@ -276,13 +360,17 @@ def _resolve_cookies(
     Resolution order (first match wins):
     1. ``cookies_file`` — explicit Netscape cookies.txt path
     2. ``cookie_string`` — raw Cookie header, auto-converted to temp file
-    3. **CDP auto-extraction** — if Chrome is running with
+    3. **Persisted cookies** — auto-loaded from ``~/.workbuddy/cookies/``
+       if a cookie file for this domain was previously saved via
+       ``--save-cookie``. This enables "save once, then just send links".
+    4. **CDP auto-extraction** — if Chrome is running with
        ``--remote-debugging-port``, cookies are pulled directly from the
        browser process via DevTools Protocol, bypassing App-Bound encryption
-    4. None — yt-dlp runs without cookies
+    5. None — yt-dlp runs without cookies
 
-    The CDP fallback (step 3) is the key fix for Windows + Chrome 127+ where
-    ``--cookies-from-browser`` fails with ``Failed to decrypt with DPAPI``.
+    The persisted cookies fallback (step 3) is the recommended workflow for
+    login-walled sites: save cookies once with ``--save-cookie``, then future
+    runs automatically pick them up without any manual steps.
     """
     if cookies_file:
         p = Path(cookies_file).expanduser()
@@ -293,6 +381,15 @@ def _resolve_cookies(
     if cookie_string:
         tmp = _cookie_string_to_file(cookie_string, url)
         return (["--cookies", tmp], tmp)
+
+    # Auto: try persisted cookies (saved via --save-cookie)
+    persisted = _persisted_cookie_path(url)
+    if persisted and persisted.exists():
+        print(
+            f"[watch] using persisted cookies: {persisted}",
+            file=sys.stderr,
+        )
+        return (["--cookies", str(persisted)], None)
 
     # Auto: try Chrome CDP (bypasses App-Bound encryption)
     if cdp_port:
@@ -527,7 +624,24 @@ if __name__ == "__main__":
         "(default 9222). Set to 0 to disable. Requires Chrome launched with "
         "--remote-debugging-port=PORT.",
     )
+    ap.add_argument(
+        "--save-cookie",
+        type=str,
+        default=None,
+        metavar="COOKIE_STRING",
+        help="Save a raw Cookie header string to ~/.workbuddy/cookies/ for "
+        "automatic reuse. After saving once, future runs auto-load cookies "
+        "without needing --cookies or --cookie-string. Use with --cookie-string "
+        "from F12 console: copy(document.cookie).",
+    )
     args = ap.parse_args()
+
+    # Save cookie if requested (saves and exits)
+    if args.save_cookie:
+        saved_path = save_cookie_string(args.save_cookie, args.source)
+        print(f"[watch] cookies saved to: {saved_path}", file=sys.stderr)
+        print("[watch] future runs will auto-load these cookies for this domain")
+        raise SystemExit(0)
 
     result = download(
         args.source,
