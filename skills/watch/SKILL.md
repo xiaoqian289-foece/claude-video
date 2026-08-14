@@ -1,6 +1,6 @@
 ---
 name: watch
-version: "0.5.0"
+version: "0.6.0"
 description: Watch a video (URL or local path). Downloads with yt-dlp, extracts auto-scaled frames with ffmpeg, pulls the transcript from captions (or Whisper API fallback), and hands the result to Claude so it can answer questions about what's in the video.
 argument-hint: "<video-url-or-path> [question]"
 allowed-tools: Bash, Read, AskUserQuestion
@@ -12,6 +12,16 @@ user-invocable: true
 ---
 
 # /watch
+
+> **⚡ LOGIN-WALLED SITES (Douyin, Bilibili, Weibo, etc.) — CHECK PERSISTED COOKIES FIRST!**
+>
+> Before asking the user for cookies, check if `~/.workbuddy/cookies/` already has a `<domain>_cookies.txt` file for the site. If it exists, the script **auto-loads it** — just run the watch command directly with **no cookie flags**. Only ask the user for cookies if the file is missing or yt-dlp reports a login/verification error.
+>
+> Quick check:
+> ```bash
+> ls ~/.workbuddy/cookies/
+> ```
+> If you see e.g. `douyin_cookies.txt`, just send the link to `watch.py` — done. No need to bother the user.
 
 You don't have a video input; this skill gives you one. A Python script gets captions first, optionally downloads the video, extracts frames as JPEGs (scene-aware, or fast keyframes at `efficient` detail), gets a timestamped transcript (native captions first, then Whisper API as fallback), and prints frame paths. You then `Read` each frame path to see the images and combine them with the transcript to answer the user.
 
@@ -276,18 +286,20 @@ This is the recommended method on Windows + Chrome 127+. It extracts cookies **d
 
 **One-time setup — launch Chrome with remote debugging:**
 
+> **Important (Windows):** Chrome/Edge on Windows requires a **non-default** `--user-data-dir` to enable remote debugging. Use a dedicated profile directory:
+
 ```bash
 # Windows (PowerShell)
-& "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222
+& "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir="$env:USERPROFILE\.workbuddy\chrome-debug-profile"
 
-# macOS
+# macOS (default profile works)
 /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=9222
 
-# Linux
+# Linux (default profile works)
 google-chrome --remote-debugging-port=9222
 ```
 
-Then log in to the video site (Douyin, Bilibili, etc.) in that Chrome instance. The watch script will automatically detect the debug port, extract matching cookies via CDP, and feed them to yt-dlp — no extra flags needed:
+Then log in to the video site (Douyin, Bilibili, etc.) in that Chrome instance. The watch script will automatically detect the debug port, extract matching cookies via CDP, and feed them to yt-dlp — no extra flags needed. Extracted cookies are **auto-persisted** to `~/.workbuddy/cookies/` so they remain available even after Chrome is closed:
 
 ```bash
 python3 "${SKILL_DIR}/scripts/watch.py" "https://www.douyin.com/video/xxxxx"
@@ -295,7 +307,7 @@ python3 "${SKILL_DIR}/scripts/watch.py" "https://www.douyin.com/video/xxxxx"
 
 You'll see `[watch] auto-extracted cookies via Chrome CDP (port 9222)` on stderr when it works.
 
-**How it works:** The script connects to `http://localhost:9222/json/version` to discover the browser's WebSocket endpoint, sends a `Network.getAllCookies` CDP command over a minimal stdlib WebSocket client (no third-party dependencies), filters cookies to the target domain, converts them to Netscape format, and passes the temp file to yt-dlp via `--cookies`. The temp file is deleted after use.
+**How it works:** The script queries `http://localhost:9222/json` to discover **page-level** WebSocket endpoints (browser-level `Network.getAllCookies` returns empty results on some Chrome versions). It connects to a page tab — preferring one whose URL matches the target domain — enables the `Network` domain, then calls `Network.getAllCookies` over a minimal stdlib WebSocket client (no third-party dependencies). Cookies are filtered to the target domain (including subdomain matching), converted to Netscape format, and passed to yt-dlp via `--cookies`. The temp file is deleted after use, and a copy is persisted to `~/.workbuddy/cookies/<domain>_cookies.txt` for offline reuse.
 
 > **Note:** Chrome must already be running with `--remote-debugging-port` before you invoke the watch script. If Chrome is not in debug mode, the script silently falls back to running yt-dlp without cookies (which may fail on login-walled sites — in that case, use Method 1 or 2 below).
 
@@ -383,7 +395,7 @@ If you already watched a video this session and the user asks a follow-up, do **
 **What this skill does NOT do:**
 - Does not upload the video itself to any API — only the extracted audio goes out, and only when native captions are missing AND Whisper is not disabled with `--no-whisper`
 - Does not access any platform account unless the user explicitly provides cookies via `--cookies` or `--cookie-string`, or Chrome is running with `--remote-debugging-port` (CDP auto-extraction). Without cookie input and without a debug port, yt-dlp only requests public data.
-- Does not log, cache, or write cookies to stdout, stderr, or persistent output files — temp cookie files are deleted after use
+- Does not log, cache, or write cookies to stdout or stderr — temp cookie files are deleted after use. CDP-extracted cookies are persisted to `~/.workbuddy/cookies/` for offline reuse (same as `--save-cookie`).
 - Does not share API keys between providers (Groq key only goes to `api.groq.com`, OpenAI key only goes to `api.openai.com`)
 - Does not log, cache, or write API keys to stdout, stderr, or output files
 - Does not persist anything outside the working directory and `~/.config/watch/.env` — clean up the working directory when you're done (Step 5)
