@@ -6,13 +6,17 @@ transcribe.py can parse them without needing Whisper.
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
 import shutil
+import socket
+import struct
 import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -56,16 +60,229 @@ def _cookie_string_to_file(cookie_string: str, url: str) -> str:
     return tmp_path
 
 
+def _ws_send_recv(host: str, port: int, ws_path: str, message: dict, timeout: int = 10) -> dict | None:
+    """Minimal WebSocket client using only the stdlib ``socket`` module.
+
+    Performs the HTTP upgrade handshake, sends one JSON message (masked, as
+    required for client-to-server frames), and reads one response frame.
+    No third-party dependencies — works on a bare Python install.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    try:
+        sock.connect((host, port))
+
+        # --- HTTP upgrade handshake ---
+        ws_key = base64.b64encode(os.urandom(16)).decode()
+        handshake = (
+            f"GET {ws_path} HTTP/1.1\r\n"
+            f"Host: {host}:{port}\r\n"
+            f"Upgrade: websocket\r\n"
+            f"Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {ws_key}\r\n"
+            f"Sec-WebSocket-Version: 13\r\n"
+            f"\r\n"
+        )
+        sock.sendall(handshake.encode())
+
+        # Read until end of HTTP headers
+        raw = b""
+        while b"\r\n\r\n" not in raw:
+            chunk = sock.recv(4096)
+            if not chunk:
+                raise ConnectionError("connection closed during handshake")
+            raw += chunk
+
+        status_line = raw.split(b"\r\n")[0]
+        if b"101" not in status_line:
+            raise ConnectionError(f"handshake failed: {status_line.decode(errors='replace')}")
+
+        # --- Send message (client frames MUST be masked) ---
+        payload = json.dumps(message).encode()
+        mask_key = os.urandom(4)
+
+        if len(payload) < 126:
+            header = struct.pack("!BB", 0x81, 0x80 | len(payload))
+        elif len(payload) < 65536:
+            header = struct.pack("!BBH", 0x81, 0x80 | 126, len(payload))
+        else:
+            header = struct.pack("!BBQ", 0x81, 0x80 | 127, len(payload))
+
+        masked = bytearray(payload)
+        for i in range(len(masked)):
+            masked[i] ^= mask_key[i % 4]
+
+        sock.sendall(header + mask_key + bytes(masked))
+
+        # --- Receive response frame(s) ---
+        data = _ws_recv(sock)
+        if data is None:
+            return None
+        return json.loads(data)
+    finally:
+        sock.close()
+
+
+def _ws_recv(sock: socket.socket) -> str | None:
+    """Read one (possibly fragmented) WebSocket text message from *sock*."""
+    chunks: list[str] = []
+    while True:
+        # First 2 bytes: FIN + opcode, MASK + length
+        hdr = sock.recv(2)
+        if len(hdr) < 2:
+            break
+
+        fin = hdr[0] & 0x80
+        opcode = hdr[0] & 0x0F
+        masked = hdr[1] & 0x80
+        length = hdr[1] & 0x7F
+
+        if length == 126:
+            ext = sock.recv(2)
+            length = struct.unpack("!H", ext)[0]
+        elif length == 127:
+            ext = sock.recv(8)
+            length = struct.unpack("!Q", ext)[0]
+
+        mask_key = sock.recv(4) if masked else b""
+
+        payload = b""
+        while len(payload) < length:
+            chunk = sock.recv(min(65536, length - len(payload)))
+            if not chunk:
+                break
+            payload += chunk
+
+        if masked:
+            payload = bytes(
+                payload[i] ^ mask_key[i % 4] for i in range(len(payload))
+            )
+
+        # opcode 0x01 = text, 0x00 = continuation, 0x08 = close, 0x09 = ping
+        if opcode == 0x08:
+            break
+        if opcode in (0x01, 0x00):
+            chunks.append(payload.decode(errors="replace"))
+        if fin:
+            break
+
+    return "".join(chunks) if chunks else None
+
+
+def _get_cookies_via_cdp(port: int, url: str) -> str | None:
+    """Extract cookies from Chrome via the DevTools Protocol.
+
+    Connects to Chrome's remote-debugging port, calls
+    ``Network.getAllCookies`` over WebSocket, and returns a path to a
+    temporary Netscape-format cookies.txt containing only cookies that
+    match the URL's domain.
+
+    This bypasses Chrome 127+ App-Bound encryption entirely: the cookies
+    are retrieved *from inside the Chrome process* via CDP, so no DPAPI
+    decryption is needed.
+
+    Returns ``None`` if Chrome is not running with ``--remote-debugging-port``
+    or if no matching cookies are found.
+    """
+    # 1. Discover the browser-level WebSocket endpoint via HTTP
+    try:
+        req = urllib.request.Request(
+            f"http://localhost:{port}/json/version",
+            headers={"Accept": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            version_info = json.loads(resp.read())
+    except Exception:
+        return None  # Chrome not in debug mode — silent fallback
+
+    ws_url = version_info.get("webSocketDebuggerUrl")
+    if not ws_url:
+        return None
+
+    # Parse ws://host:port/path
+    parsed = urlparse(ws_url)
+    ws_host = parsed.hostname or "localhost"
+    ws_port = parsed.port or port
+    ws_path = parsed.path or "/"
+
+    # 2. Request all cookies via CDP
+    result = _ws_send_recv(
+        ws_host, ws_port, ws_path,
+        {"id": 1, "method": "Network.getAllCookies"},
+        timeout=10,
+    )
+    if not result or "result" not in result:
+        return None
+
+    all_cookies = result["result"].get("cookies", [])
+    if not all_cookies:
+        return None
+
+    # 3. Filter to cookies matching the target URL's domain
+    target_domain = urlparse(url).hostname or ""
+    # Strip leading www. for matching but keep original for comparison
+    target_root = target_domain.lstrip("www.")
+
+    matching = []
+    for ck in all_cookies:
+        ck_domain = ck.get("domain", "")
+        # CDP cookie domains may start with '.' (match subdomains) or not
+        clean_domain = ck_domain.lstrip(".")
+        if (
+            target_domain == clean_domain
+            or target_domain.endswith("." + clean_domain)
+            or clean_domain.endswith("." + target_root)
+            or target_root == clean_domain
+        ):
+            matching.append(ck)
+
+    if not matching:
+        return None
+
+    # 4. Convert to Netscape cookies.txt format
+    lines = [
+        "# Netscape HTTP Cookie File",
+        "# Auto-extracted via Chrome DevTools Protocol (CDP)",
+        f"# Source: localhost:{port} → {target_domain}",
+    ]
+    for ck in matching:
+        domain = ck.get("domain", "")
+        include_sub = "TRUE" if domain.startswith(".") else "FALSE"
+        path = ck.get("path", "/")
+        secure = "TRUE" if ck.get("secure", False) else "FALSE"
+        expires = ck.get("expires", -1)
+        if expires is None or expires < 0:
+            expires = int(time.time()) + 7 * 86400  # session cookie → 7-day expiry
+        else:
+            expires = int(expires)
+        name = ck.get("name", "")
+        value = ck.get("value", "")
+        lines.append(f"{domain}\t{include_sub}\t{path}\t{secure}\t{expires}\t{name}\t{value}")
+
+    fd, tmp_path = tempfile.mkstemp(suffix=".txt", prefix="watch_cdp_cookies_")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    return tmp_path
+
+
 def _resolve_cookies(
     cookies_file: str | None,
     cookie_string: str | None,
     url: str,
+    cdp_port: int | None = 9222,
 ) -> tuple[list[str], str | None]:
     """Return ``(yt_dlp_args, temp_path_to_clean)`` for cookie injection.
 
-    - ``cookies_file`` (path to a Netscape cookies.txt) takes precedence.
-    - ``cookie_string`` (raw Cookie header) is converted to a temp Netscape file.
-    - If neither is set, returns ``([], None)``.
+    Resolution order (first match wins):
+    1. ``cookies_file`` — explicit Netscape cookies.txt path
+    2. ``cookie_string`` — raw Cookie header, auto-converted to temp file
+    3. **CDP auto-extraction** — if Chrome is running with
+       ``--remote-debugging-port``, cookies are pulled directly from the
+       browser process via DevTools Protocol, bypassing App-Bound encryption
+    4. None — yt-dlp runs without cookies
+
+    The CDP fallback (step 3) is the key fix for Windows + Chrome 127+ where
+    ``--cookies-from-browser`` fails with ``Failed to decrypt with DPAPI``.
     """
     if cookies_file:
         p = Path(cookies_file).expanduser()
@@ -76,6 +293,19 @@ def _resolve_cookies(
     if cookie_string:
         tmp = _cookie_string_to_file(cookie_string, url)
         return (["--cookies", tmp], tmp)
+
+    # Auto: try Chrome CDP (bypasses App-Bound encryption)
+    if cdp_port:
+        try:
+            tmp = _get_cookies_via_cdp(cdp_port, url)
+            if tmp:
+                print(
+                    f"[watch] auto-extracted cookies via Chrome CDP (port {cdp_port})",
+                    file=sys.stderr,
+                )
+                return (["--cookies", tmp], tmp)
+        except Exception as exc:
+            print(f"[watch] CDP cookie extraction skipped: {exc}", file=sys.stderr)
 
     return ([], None)
 
@@ -130,6 +360,7 @@ def fetch_captions(
     out_dir: Path,
     cookies_file: str | None = None,
     cookie_string: str | None = None,
+    cdp_port: int | None = 9222,
 ) -> dict:
     """Fetch metadata and best available VTT captions without downloading video."""
     if shutil.which("yt-dlp") is None:
@@ -137,7 +368,7 @@ def fetch_captions(
 
     out_dir.mkdir(parents=True, exist_ok=True)
     output_template = str(out_dir / "video.%(ext)s")
-    cookie_args, cookie_tmp = _resolve_cookies(cookies_file, cookie_string, url)
+    cookie_args, cookie_tmp = _resolve_cookies(cookies_file, cookie_string, url, cdp_port)
     cmd = [
         "yt-dlp",
         "--skip-download",
@@ -192,6 +423,7 @@ def download_url(
     audio_only: bool = False,
     cookies_file: str | None = None,
     cookie_string: str | None = None,
+    cdp_port: int | None = 9222,
 ) -> dict:
     if shutil.which("yt-dlp") is None:
         raise SystemExit("yt-dlp is not installed. Install with: brew install yt-dlp")
@@ -200,7 +432,7 @@ def download_url(
     output_template = str(out_dir / "video.%(ext)s")
 
     fmt = "ba/bestaudio" if audio_only else "bv*[height<=720]+ba/b[height<=720]/bv+ba/b"
-    cookie_args, cookie_tmp = _resolve_cookies(cookies_file, cookie_string, url)
+    cookie_args, cookie_tmp = _resolve_cookies(cookies_file, cookie_string, url, cdp_port)
     cmd = [
         "yt-dlp",
         "-N", "8",
@@ -250,6 +482,7 @@ def download(
     audio_only: bool = False,
     cookies_file: str | None = None,
     cookie_string: str | None = None,
+    cdp_port: int | None = 9222,
 ) -> dict:
     if is_url(source):
         return download_url(
@@ -258,6 +491,7 @@ def download(
             audio_only=audio_only,
             cookies_file=cookies_file,
             cookie_string=cookie_string,
+            cdp_port=cdp_port,
         )
     return resolve_local(source)
 
@@ -285,6 +519,14 @@ if __name__ == "__main__":
         help='Raw Cookie header string (e.g. from F12 Network tab). '
         'Automatically converted to a temp cookies.txt for yt-dlp.',
     )
+    ap.add_argument(
+        "--cdp-port",
+        type=int,
+        default=9222,
+        help="Chrome DevTools Protocol port for automatic cookie extraction "
+        "(default 9222). Set to 0 to disable. Requires Chrome launched with "
+        "--remote-debugging-port=PORT.",
+    )
     args = ap.parse_args()
 
     result = download(
@@ -293,5 +535,6 @@ if __name__ == "__main__":
         audio_only=args.audio_only,
         cookies_file=args.cookies,
         cookie_string=args.cookie_string,
+        cdp_port=args.cdp_port if args.cdp_port > 0 else None,
     )
     print(json.dumps(result, indent=2))
