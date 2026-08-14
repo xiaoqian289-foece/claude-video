@@ -91,7 +91,25 @@ def main() -> int:
         "--remote-debugging-port=PORT. Bypasses App-Bound encryption on "
         "Windows + Chrome 127+.",
     )
+    ap.add_argument(
+        "--save-cookie",
+        type=str,
+        default=None,
+        metavar="COOKIE_STRING",
+        help="Save a raw Cookie header string to ~/.workbuddy/cookies/ for "
+        "automatic reuse. After saving once, future runs auto-load cookies "
+        "for that domain without needing --cookies or --cookie-string. "
+        "Get the string via F12 console: copy(document.cookie).",
+    )
     args = ap.parse_args()
+
+    # Save cookie if requested (saves and exits)
+    if args.save_cookie:
+        from download import save_cookie_string
+        saved_path = save_cookie_string(args.save_cookie, args.source)
+        print(f"[watch] cookies saved to: {saved_path}", file=sys.stderr)
+        print(f"[watch] future runs will auto-load these cookies for this domain", file=sys.stderr)
+        return 0
 
     config = get_config()
     detail = args.detail or str(config["detail"])
