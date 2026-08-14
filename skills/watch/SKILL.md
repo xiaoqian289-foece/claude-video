@@ -1,6 +1,6 @@
 ---
 name: watch
-version: "0.3.0"
+version: "0.4.0"
 description: Watch a video (URL or local path). Downloads with yt-dlp, extracts auto-scaled frames with ffmpeg, pulls the transcript from captions (or Whisper API fallback), and hands the result to Claude so it can answer questions about what's in the video.
 argument-hint: "<video-url-or-path> [question]"
 allowed-tools: Bash, Read, AskUserQuestion
@@ -152,6 +152,7 @@ Optional flags:
 - `--no-dedup` — keep near-duplicate frames. By default a frame-delta pass drops frames that are visually near-identical to the previous kept one (held slides, static screen recordings, paused video) so the frame budget goes to distinct content; the report's **Frames** line notes how many were dropped. Pass this only if the user needs every sampled frame (e.g. judging subtle frame-to-frame motion).
 - `--cookies FILE` — path to a Netscape-format cookies.txt file for login-walled sites (Douyin, Bilibili, etc.). See [Login-walled videos](#login-walled-videos-douyin-bilibili-etc) below.
 - `--cookie-string "k=v; k2=v2"` — raw Cookie header string (e.g. copied from F12 → Network → Request Headers → Cookie). Automatically converted to a temp cookies.txt. Use this when `--cookies-from-browser` fails due to Chrome App-Bound encryption (Chrome 127+ on Windows).
+- `--cdp-port PORT` — Chrome DevTools Protocol port for **automatic** cookie extraction (default 9222, set to 0 to disable). When Chrome is running with `--remote-debugging-port=PORT`, the script pulls cookies directly from the browser process via CDP — bypassing App-Bound encryption entirely. No manual cookie copying needed. See [Login-walled videos](#login-walled-videos-douyin-bilibili-etc) below.
 
 ### Focusing on a section (higher frame rate)
 
@@ -228,9 +229,38 @@ Some platforms require a logged-in session for yt-dlp to access video metadata o
 
 **Root cause:** The site serves a bot-detection challenge to anonymous (cookie-less) requests. yt-dlp's built-in `--cookies-from-browser` option should work, but on **Windows with Chrome 127+** it fails because Chrome introduced [App-Bound encryption](https://developer.chrome.com/blog/app-bound-encryption) — cookies are encrypted with a key that only the Chrome process itself can access. External tools (yt-dlp, any Python library) read ciphertext and get DPAPI decryption errors (`Failed to decrypt with DPAPI`). Closing Chrome doesn't help; the encryption mechanism blocks all external access regardless of whether Chrome is running.
 
-**Solution — pass cookies manually via one of two methods:**
+**Solution — three methods, try Method 0 first (fully automatic):**
 
-### Method 1: `--cookie-string` (quickest, no extra tools)
+### Method 0: `--cdp-port` (automatic, no manual cookie copying)
+
+This is the recommended method on Windows + Chrome 127+. It extracts cookies **directly from the Chrome process** via the DevTools Protocol, completely bypassing App-Bound encryption — no DPAPI, no manual copying.
+
+**One-time setup — launch Chrome with remote debugging:**
+
+```bash
+# Windows (PowerShell)
+& "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222
+
+# macOS
+/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=9222
+
+# Linux
+google-chrome --remote-debugging-port=9222
+```
+
+Then log in to the video site (Douyin, Bilibili, etc.) in that Chrome instance. The watch script will automatically detect the debug port, extract matching cookies via CDP, and feed them to yt-dlp — no extra flags needed:
+
+```bash
+python3 "${SKILL_DIR}/scripts/watch.py" "https://www.douyin.com/video/xxxxx"
+```
+
+You'll see `[watch] auto-extracted cookies via Chrome CDP (port 9222)` on stderr when it works.
+
+**How it works:** The script connects to `http://localhost:9222/json/version` to discover the browser's WebSocket endpoint, sends a `Network.getAllCookies` CDP command over a minimal stdlib WebSocket client (no third-party dependencies), filters cookies to the target domain, converts them to Netscape format, and passes the temp file to yt-dlp via `--cookies`. The temp file is deleted after use.
+
+> **Note:** Chrome must already be running with `--remote-debugging-port` before you invoke the watch script. If Chrome is not in debug mode, the script silently falls back to running yt-dlp without cookies (which may fail on login-walled sites — in that case, use Method 1 or 2 below).
+
+### Method 1: `--cookie-string` (quick manual fallback)
 
 1. Open the video page in your browser (where you're logged in).
 2. Press **F12** → **Network** tab.
@@ -262,11 +292,12 @@ python3 "${SKILL_DIR}/scripts/watch.py" "https://www.douyin.com/video/xxxxx" \
 
 | Situation | Recommended method |
 |-----------|-------------------|
-| Quick one-off, no extensions to install | `--cookie-string` |
-| Repeated use across multiple videos from the same site | `--cookies FILE` |
-| `--cookies-from-browser` fails with DPAPI/encryption error | Either (both bypass the browser entirely) |
+| Windows + Chrome 127+ (DPAPI error), Chrome can be restarted | `--cdp-port` (automatic, no manual steps) |
+| Quick one-off, Chrome debug port not available | `--cookie-string` |
+| Repeated use across multiple videos from the same site | `--cdp-port` (if Chrome can run debug mode) or `--cookies FILE` |
+| `--cookies-from-browser` fails with DPAPI/encryption error | `--cdp-port` (preferred) or `--cookie-string` (fallback) |
 
-**Security note:** Cookie strings grant the same access as your logged-in session. The script writes them only to a temporary file (deleted after use) and never logs them. For maximum safety, use a fresh incognito session to capture cookies rather than your main session.
+**Security note:** Cookie strings and CDP-extracted cookies grant the same access as your logged-in session. The script writes them only to a temporary file (deleted after use) and never logs them. CDP extraction connects only to `localhost` and never transmits cookies over the network. For maximum safety with `--cookie-string`, use a fresh incognito session to capture cookies rather than your main session.
 
 ## Transcription
 
@@ -301,6 +332,7 @@ If you already watched a video this session and the user asks a follow-up, do **
 **What this skill does:**
 - Runs `yt-dlp` locally to download the video and pull native captions when the source supports them (public data; the request goes directly to whatever host the URL points at)
 - When the user explicitly provides cookies via `--cookies` or `--cookie-string`, passes them to yt-dlp to access login-walled content (e.g. Douyin, Bilibili). Cookie strings are written to a temporary file that is deleted immediately after the yt-dlp subprocess completes.
+- When Chrome is running with `--remote-debugging-port` (default 9222), automatically extracts cookies from the browser process via the DevTools Protocol (CDP) to bypass App-Bound encryption on Windows + Chrome 127+. CDP communication is local-only (localhost WebSocket). Extracted cookies are written to a temporary file that is deleted after use.
 - Runs `ffmpeg` / `ffprobe` locally to extract frames as JPEGs and, when Whisper is needed, a mono 16 kHz audio clip
 - Sends the extracted audio clip to Groq's Whisper API (`api.groq.com/openai/v1/audio/transcriptions`) when `GROQ_API_KEY` is set (preferred — cheaper, faster)
 - Sends the extracted audio clip to OpenAI's audio transcription API (`api.openai.com/v1/audio/transcriptions`) when `OPENAI_API_KEY` is set and Groq is not, or when `--whisper openai` is forced
@@ -309,7 +341,7 @@ If you already watched a video this session and the user asks a follow-up, do **
 
 **What this skill does NOT do:**
 - Does not upload the video itself to any API — only the extracted audio goes out, and only when native captions are missing AND Whisper is not disabled with `--no-whisper`
-- Does not access any platform account unless the user explicitly provides cookies via `--cookies` or `--cookie-string`. Without explicit cookie input, yt-dlp only requests public data.
+- Does not access any platform account unless the user explicitly provides cookies via `--cookies` or `--cookie-string`, or Chrome is running with `--remote-debugging-port` (CDP auto-extraction). Without cookie input and without a debug port, yt-dlp only requests public data.
 - Does not log, cache, or write cookies to stdout, stderr, or persistent output files — temp cookie files are deleted after use
 - Does not share API keys between providers (Groq key only goes to `api.groq.com`, OpenAI key only goes to `api.openai.com`)
 - Does not log, cache, or write API keys to stdout, stderr, or output files
