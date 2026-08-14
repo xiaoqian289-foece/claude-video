@@ -253,13 +253,66 @@ def _ws_recv(sock: socket.socket) -> str | None:
     return "".join(chunks) if chunks else None
 
 
+def _ws_send_frame(sock: socket.socket, message: dict) -> None:
+    """Send a single masked WebSocket text frame (client → server)."""
+    payload = json.dumps(message).encode()
+    mask_key = os.urandom(4)
+    if len(payload) < 126:
+        header = struct.pack("!BB", 0x81, 0x80 | len(payload))
+    elif len(payload) < 65536:
+        header = struct.pack("!BBH", 0x81, 0x80 | 126, len(payload))
+    else:
+        header = struct.pack("!BBQ", 0x81, 0x80 | 127, len(payload))
+    masked = bytearray(payload)
+    for i in range(len(masked)):
+        masked[i] ^= mask_key[i % 4]
+    sock.sendall(header + mask_key + bytes(masked))
+
+
+def _ws_recv_json(sock: socket.socket, expected_id: int | None = None, timeout: int = 10) -> dict | None:
+    """Read WebSocket frames until a JSON response with the expected id arrives.
+
+    CDP may emit event notifications between command responses; this helper
+    skips those and returns only the matching response dict.
+    """
+    sock.settimeout(timeout)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        raw = _ws_recv(sock)
+        if raw is None:
+            return None
+        try:
+            obj = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if expected_id is not None and obj.get("id") != expected_id:
+            continue  # event or different response — skip
+        return obj
+    return None
+
+
+def _extract_root_domain(hostname: str) -> str:
+    """Extract the root domain from a hostname.
+
+    ``v.douyin.com`` → ``douyin.com``, ``www.bilibili.com`` → ``bilibili.com``.
+    Simple last-two-parts heuristic; sufficient for the supported sites.
+    """
+    parts = hostname.split(".")
+    if len(parts) >= 2:
+        return ".".join(parts[-2:])
+    return hostname
+
+
 def _get_cookies_via_cdp(port: int, url: str) -> str | None:
     """Extract cookies from Chrome via the DevTools Protocol.
 
-    Connects to Chrome's remote-debugging port, calls
-    ``Network.getAllCookies`` over WebSocket, and returns a path to a
-    temporary Netscape-format cookies.txt containing only cookies that
-    match the URL's domain.
+    Connects to a **page-level** WebSocket endpoint (from ``/json``),
+    enables the ``Network`` domain, then calls ``Network.getAllCookies``
+    to retrieve all cookies including HttpOnly ones.
+
+    The page-level endpoint is required because ``Network.getAllCookies``
+    returns empty results on the browser-level endpoint in some Chrome
+    versions.
 
     This bypasses Chrome 127+ App-Bound encryption entirely: the cookies
     are retrieved *from inside the Chrome process* via CDP, so no DPAPI
@@ -268,33 +321,92 @@ def _get_cookies_via_cdp(port: int, url: str) -> str | None:
     Returns ``None`` if Chrome is not running with ``--remote-debugging-port``
     or if no matching cookies are found.
     """
-    # 1. Discover the browser-level WebSocket endpoint via HTTP
+    # 1. Verify Chrome is in debug mode
     try:
         req = urllib.request.Request(
             f"http://localhost:{port}/json/version",
             headers={"Accept": "application/json"},
         )
         with urllib.request.urlopen(req, timeout=5) as resp:
-            version_info = json.loads(resp.read())
+            json.loads(resp.read())
     except Exception:
         return None  # Chrome not in debug mode — silent fallback
 
-    ws_url = version_info.get("webSocketDebuggerUrl")
-    if not ws_url:
+    # 2. Extract target domain info for tab matching and cookie filtering
+    target_domain = urlparse(url).hostname or ""
+    target_root = _extract_root_domain(target_domain)
+
+    # 3. Find a page-level WebSocket endpoint (prefer one on the target domain)
+    page_ws_url = None
+    try:
+        req = urllib.request.Request(
+            f"http://localhost:{port}/json",
+            headers={"Accept": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            tabs = json.loads(resp.read())
+        # Prefer a tab whose URL contains the target root domain
+        for tab in tabs:
+            if tab.get("type") != "page":
+                continue
+            if target_root and target_root in tab.get("url", ""):
+                page_ws_url = tab.get("webSocketDebuggerUrl")
+                break
+        # Fallback: any page tab
+        if not page_ws_url:
+            for tab in tabs:
+                if tab.get("type") == "page":
+                    page_ws_url = tab.get("webSocketDebuggerUrl")
+                    break
+    except Exception:
         return None
 
-    # Parse ws://host:port/path
-    parsed = urlparse(ws_url)
+    if not page_ws_url:
+        return None
+
+    parsed = urlparse(page_ws_url)
     ws_host = parsed.hostname or "localhost"
     ws_port = parsed.port or port
     ws_path = parsed.path or "/"
 
-    # 2. Request all cookies via CDP
-    result = _ws_send_recv(
-        ws_host, ws_port, ws_path,
-        {"id": 1, "method": "Network.getAllCookies"},
-        timeout=10,
-    )
+    # 4. Connect, enable Network domain, then get all cookies
+    #    (Network.enable must precede getAllCookies on the same connection)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(15)
+    try:
+        sock.connect((ws_host, ws_port))
+
+        # WebSocket upgrade handshake
+        ws_key = base64.b64encode(os.urandom(16)).decode()
+        handshake = (
+            f"GET {ws_path} HTTP/1.1\r\n"
+            f"Host: {ws_host}:{ws_port}\r\n"
+            f"Upgrade: websocket\r\n"
+            f"Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {ws_key}\r\n"
+            f"Sec-WebSocket-Version: 13\r\n"
+            f"\r\n"
+        )
+        sock.sendall(handshake.encode())
+        raw = b""
+        while b"\r\n\r\n" not in raw:
+            chunk = sock.recv(4096)
+            if not chunk:
+                raise ConnectionError("connection closed during handshake")
+            raw += chunk
+        if b"101" not in raw.split(b"\r\n")[0]:
+            raise ConnectionError("WebSocket handshake failed")
+
+        # Enable Network domain (required before getAllCookies on page target)
+        _ws_send_frame(sock, {"id": 1, "method": "Network.enable"})
+        _ws_recv_json(sock, expected_id=1, timeout=5)
+
+        # Request all cookies
+        _ws_send_frame(sock, {"id": 2, "method": "Network.getAllCookies"})
+        result = _ws_recv_json(sock, expected_id=2, timeout=10)
+    finally:
+        sock.close()
+
     if not result or "result" not in result:
         return None
 
@@ -302,28 +414,24 @@ def _get_cookies_via_cdp(port: int, url: str) -> str | None:
     if not all_cookies:
         return None
 
-    # 3. Filter to cookies matching the target URL's domain
-    target_domain = urlparse(url).hostname or ""
-    # Strip leading www. for matching but keep original for comparison
-    target_root = target_domain.lstrip("www.")
-
+    # 5. Filter to cookies matching the target URL's domain
     matching = []
     for ck in all_cookies:
         ck_domain = ck.get("domain", "")
-        # CDP cookie domains may start with '.' (match subdomains) or not
         clean_domain = ck_domain.lstrip(".")
         if (
             target_domain == clean_domain
             or target_domain.endswith("." + clean_domain)
             or clean_domain.endswith("." + target_root)
             or target_root == clean_domain
+            or target_root in clean_domain
         ):
             matching.append(ck)
 
     if not matching:
         return None
 
-    # 4. Convert to Netscape cookies.txt format
+    # 6. Convert to Netscape cookies.txt format
     lines = [
         "# Netscape HTTP Cookie File",
         "# Auto-extracted via Chrome DevTools Protocol (CDP)",
@@ -400,6 +508,19 @@ def _resolve_cookies(
                     f"[watch] auto-extracted cookies via Chrome CDP (port {cdp_port})",
                     file=sys.stderr,
                 )
+                # Persist CDP-extracted cookies for offline use
+                persisted = _persisted_cookie_path(url)
+                if persisted:
+                    try:
+                        persisted.parent.mkdir(parents=True, exist_ok=True)
+                        import shutil as _shutil
+                        _shutil.copy2(tmp, persisted)
+                        print(
+                            f"[watch] persisted cookies to {persisted}",
+                            file=sys.stderr,
+                        )
+                    except Exception:
+                        pass  # non-fatal — temp file still works
                 return (["--cookies", tmp], tmp)
         except Exception as exc:
             print(f"[watch] CDP cookie extraction skipped: {exc}", file=sys.stderr)
